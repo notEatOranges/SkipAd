@@ -1,0 +1,23 @@
+<resources>
+    <string name="app_name">SkipAd</string>
+    <string name="app_subtitle">开屏广告自动跳过 · 零联网权限 · 本地识别</string>
+
+    <string name="section_status">无障碍服务</string>
+    <string name="status_on">✓ 已开启，正在自动跳过开屏广告</string>
+    <string name="status_off">✗ 未开启，点下方按钮去系统设置开启</string>
+    <string name="action_enable">去开启无障碍服务</string>
+    <string name="action_open_settings">查看无障碍设置</string>
+
+    <string name="section_stats">跳过统计</string>
+    <string name="stats_format">累计已跳过 %1$d 次开屏广告</string>
+    <string name="action_clear">清空统计</string>
+
+    <string name="section_log">最近记录</string>
+    <string name="log_empty">暂无记录——开启服务后，每次成功跳过都会记在这里</string>
+
+    <string name="footer_note">M1 内置通用关键字规则（跳过 / Skip / 倒计时），带防误触约束（文本长度 + 按钮面积）。\n路线图：per-App 规则 → 节点快照 + 截屏调试 → 录屏分析 → 社区规则兼容，详见仓库 docs/design.md</string>
+
+    <string name="accessibility_service_label">SkipAd 开屏跳过</string>
+    <string name="accessibility_service_summary">自动点击开屏广告的“跳过”按钮</string>
+    <string name="accessibility_service_description">SkipAd 监听窗口内容变化，识别并自动点击开屏广告中的“跳过”按钮。本应用不申请网络与存储权限，不读取、不上传任何数据，所有识别均在本地完成。</string>
+</resources>
