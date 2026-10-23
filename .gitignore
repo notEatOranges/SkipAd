@@ -13,3 +13,4 @@ build/
 *.keystore
 *.jks
 *.log
+_slim.py
