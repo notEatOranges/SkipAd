@@ -31,6 +31,10 @@ class NodeScanner(rules: List<SkipRule>) {
         )
     }
 
+    /** 最近一次扫描的诊断信息（节点数/采样文本/匹配与拒绝原因），供真机排查 */
+    var lastDebug: String? = null
+        private set
+
     /** 返回 (可点击目标节点, 命中的规则)；找不到返回 null */
     fun findSkipTarget(
         root: AccessibilityNodeInfo,
@@ -44,22 +48,39 @@ class NodeScanner(rules: List<SkipRule>) {
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
         var visited = 0
+        val samples = LinkedHashSet<String>()
+        var reject: String? = null
 
         while (queue.isNotEmpty()) {
-            if (visited++ > MAX_NODES || System.currentTimeMillis() > deadline) return null
+            if (visited++ > MAX_NODES || System.currentTimeMillis() > deadline) {
+                lastDebug = "ABORT nodes=$visited texts=${samples.joinToString("|").take(180)}"
+                return null
+            }
             val node = queue.removeFirst()
 
+            val text = nodeText(node)
+            if (text != null && samples.size < 20) samples.add(text.take(16))
             val matched = firstMatch(node)
-            if (matched != null) {
-                val text = nodeText(node)
-                if (text != null && text.length <= matched.maxTextLength) {
+            if (matched != null && text != null) {
+                if (text.length > matched.maxTextLength) {
+                    reject = "「${text.take(12)}」文本超长(${text.length})"
+                } else {
                     val clickable = clickableAncestor(node)
-                    if (clickable != null && clickable.isVisibleToUser) {
-                        val rect = Rect()
-                        clickable.getBoundsInScreen(rect)
-                        val area = rect.width().toFloat() * rect.height()
-                        if (area in 1f..screenArea * matched.maxAreaRatio) {
-                            return clickable to matched
+                    when {
+                        clickable == null ->
+                            reject = "「${text.take(12)}」无可点击祖先(6级内)"
+                        !clickable.isVisibleToUser ->
+                            reject = "「${text.take(12)}」祖先不可见"
+                        else -> {
+                            val rect = Rect()
+                            clickable.getBoundsInScreen(rect)
+                            val area = rect.width().toFloat() * rect.height()
+                            val pct = (area / screenArea * 100).toInt()
+                            if (area in 1f..screenArea * matched.maxAreaRatio) {
+                                lastDebug = "HIT「${text.take(16)}」面积${pct}% 规则=${matched.id}"
+                                return clickable to matched
+                            }
+                            reject = "「${text.take(12)}」祖先面积${pct}%超限"
                         }
                     }
                 }
@@ -69,6 +90,8 @@ class NodeScanner(rules: List<SkipRule>) {
                 node.getChild(i)?.let(queue::add)
             }
         }
+        lastDebug = "no-match nodes=$visited texts=[${samples.joinToString("|").take(180)}]" +
+            (reject?.let { " reject=$it" } ?: "")
         return null
     }
 

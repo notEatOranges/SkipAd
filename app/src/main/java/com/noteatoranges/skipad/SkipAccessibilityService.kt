@@ -2,7 +2,11 @@ package com.noteatoranges.skipad
 
 import android.accessibilityservice.AccessibilityService
 import android.content.Intent
+import android.graphics.Rect
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
+import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import com.noteatoranges.skipad.core.BuiltinRules
 import com.noteatoranges.skipad.core.ClickPerformer
@@ -15,10 +19,11 @@ import com.noteatoranges.skipad.store.StatsStore
  * 核心无障碍服务：窗口事件 → 节点树匹配"跳过" → 模拟点击。
  *
  * 性能与稳定性设计（完整论证见 docs/design.md §3）：
- * - 事件节流：全局时间窗，抵御 TYPE_WINDOW_CONTENT_CHANGED 事件风暴；
- * - 包名黑名单：系统 UI / 桌面启动器直接忽略，不做节点遍历（粗筛先行）；
- * - 会话冷却：同一窗口成功跳过后冷却期内不重复动作，防误点二级页面；
- * - 用 rootInActiveWindow 而非 event.source：后者在 CONTENT_CHANGED 里可能是局部小节点。
+ * - 事件节流 + 包名黑名单（静态系统包 + 动态 HOME 桌面）+ 会话冷却；
+ * - **点击后验证制（0.4.1）**：国产广告 SDK 普遍不理会 ACTION_CLICK（只认真实触摸），
+ *   "performAction 返回 true"不等于广告被跳过——800ms 后重扫窗口，目标还在就改用
+ *   dispatchGesture 真实手势补刀（最多 2 次），**广告真消失才记一次跳过**；
+ * - 用 rootInActiveWindow 而非 event.source；全链路诊断日志打 TAG=SkipAdEngine。
  */
 class SkipAccessibilityService : AccessibilityService() {
 
@@ -29,9 +34,15 @@ class SkipAccessibilityService : AccessibilityService() {
     private var lastSkipWindow: String? = null
     private var lastSkipAt = 0L
 
-    /** 黑名单 = 静态系统包 + onServiceConnected 时动态解析的 HOME 桌面 */
-    @Volatile
-    private var blacklist: Set<String> = PACKAGE_BLACKLIST
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var pending: PendingSkip? = null
+
+    private data class PendingSkip(
+        val windowKey: String,
+        val pkg: String,
+        val detail: String,
+        var attempts: Int,
+    )
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -87,24 +98,63 @@ class SkipAccessibilityService : AccessibilityService() {
         val windowKey = "$pkg/${event.className ?: root.className ?: ""}"
         if (windowKey == lastSkipWindow && now - lastSkipAt < COOLDOWN_MS) return
 
-        val metrics = resources.displayMetrics
-        val hit = scanner?.findSkipTarget(root, metrics.widthPixels, metrics.heightPixels)
-            ?: return
+        val hit = scanner?.findSkipTarget(root, resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels)
+        if (hit == null) {
+            Log.d(TAG, "scan $pkg: ${scanner?.lastDebug}")
+            return
+        }
         val detail = hit.first.text?.toString()
             ?: hit.first.contentDescription?.toString()
             ?: hit.second.id
+        Log.d(TAG, "match $pkg: ${scanner?.lastDebug}")
 
         if (clicker?.click(hit.first) == true) {
             lastSkipWindow = windowKey
             lastSkipAt = now
-            StatsDb.get(this).insert(pkg, detail)
+            pending = PendingSkip(windowKey, pkg, detail, 0)
+            val token = pending
+            mainHandler.postDelayed({ if (pending === token) verifySkip() }, VERIFY_DELAY_MS)
         }
     }
 
+    /** 点击后核验：目标还在就手势补刀，真消失才记账 */
+    private fun verifySkip() {
+        val p = pending ?: return
+        val root = rootInActiveWindow
+        val hit = root?.let { r ->
+            scanner?.findSkipTarget(r, resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels)
+        }
+        val curPkg = root?.packageName?.toString()
+        // 消失判定：窗口没了 / 扫不到目标 / 换了 App（重扫 className 与事件 className 不可比，勿比）
+        val gone = root == null || hit == null || curPkg != p.pkg
+        if (gone) {
+            StatsDb.get(this).insert(p.pkg, p.detail)
+            Log.d(TAG, "verified ${p.pkg} 「${p.detail}」 (attempts=${p.attempts})")
+            pending = null
+            return
+        }
+        if (p.attempts >= MAX_RETRY) {
+            Log.d(TAG, "giveup ${p.pkg} 「${p.detail}」广告仍在, 已补刀${p.attempts}次不记账")
+            pending = null
+            return
+        }
+        p.attempts++
+        val rect = Rect()
+        hit!!.first.getBoundsInScreen(rect)
+        if (!rect.isEmpty) {
+            val ok = clicker?.clickPoint(rect.exactCenterX(), rect.exactCenterY()) ?: false
+            Log.d(TAG, "retry#${p.attempts} ${p.pkg} gesture ok=$ok at (${rect.exactCenterX().toInt()},${rect.exactCenterY().toInt()})")
+        }
+        mainHandler.postDelayed({ if (pending === p) verifySkip() }, VERIFY_DELAY_MS)
+    }
+
     private companion object {
+        const val TAG = "SkipAdEngine"
         const val THROTTLE_MS = 150L
         const val COOLDOWN_MS = 4000L
         const val UNBIND_RECOVER_DELAY_MS = 1500L
+        const val VERIFY_DELAY_MS = 800L
+        const val MAX_RETRY = 2
 
         /** 系统包与噪声大户：直接跳过节点遍历（李跳跳同款"先粗筛再遍历"思路） */
         val PACKAGE_BLACKLIST = setOf(
@@ -116,4 +166,7 @@ class SkipAccessibilityService : AccessibilityService() {
             "com.google.android.apps.nexuslauncher",
         )
     }
+
+    @Volatile
+    private var blacklist: Set<String> = PACKAGE_BLACKLIST
 }
