@@ -76,11 +76,18 @@ class NodeScanner(rules: List<SkipRule>) {
                             clickable.getBoundsInScreen(rect)
                             val area = rect.width().toFloat() * rect.height()
                             val pct = (area / screenArea * 100).toInt()
-                            if (area in 1f..screenArea * matched.maxAreaRatio) {
+                            // 右上角锚定闸：开屏"跳过"按钮几乎总在上半屏偏右；
+                            // 页面正文里的"跳过xxx"（教程/任务/登录跳过）多在中部，直接拒绝
+                            val cx = rect.exactCenterX()
+                            val cy = rect.exactCenterY()
+                            if (cx < screenW * 0.4f || cy > screenH * 0.6f) {
+                                reject = "「${text.take(12)}」不在顶部右侧(cx=${cx.toInt()},cy=${cy.toInt()})"
+                            } else if (area in 1f..screenArea * matched.maxAreaRatio) {
                                 lastDebug = "HIT「${text.take(16)}」面积${pct}% 规则=${matched.id}"
                                 return clickable to matched
+                            } else {
+                                reject = "「${text.take(12)}」祖先面积${pct}%超限"
                             }
-                            reject = "「${text.take(12)}」祖先面积${pct}%超限"
                         }
                     }
                 }

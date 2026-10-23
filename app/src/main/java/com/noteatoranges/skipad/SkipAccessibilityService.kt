@@ -40,6 +40,10 @@ class SkipAccessibilityService : AccessibilityService() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var pending: PendingSkip? = null
 
+    /** 每个 App 最近一次"新窗口出现"的时间：开屏广告只存在于启动后的几秒内，
+     *  超出 [SPLASH_WINDOW_MS] 的窗口（浏览器长驻页面等）不再扫描，防关键字空转误触 */
+    private val lastStateChangeAt = HashMap<String, Long>()
+
     private data class PendingSkip(
         val windowKey: String,
         val pkg: String,
@@ -90,6 +94,14 @@ class SkipAccessibilityService : AccessibilityService() {
         val root = rootInActiveWindow ?: return
         val pkg = root.packageName?.toString() ?: event.packageName?.toString() ?: return
         if (pkg in blacklist || pkg == packageName) return
+
+        if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            if (lastStateChangeAt.size > 50) lastStateChangeAt.clear()
+            lastStateChangeAt[pkg] = now
+        }
+        // 启动窗口闸：只在"新窗口出现后 SPLASH_WINDOW_MS 内"扫描（开屏广告只在这段时间存在）
+        val stateAt = lastStateChangeAt[pkg] ?: 0L
+        if (now - stateAt > SPLASH_WINDOW_MS) return
 
         val windowKey = "$pkg/${event.className ?: root.className ?: ""}"
         if (windowKey == lastSkipWindow && now - lastSkipAt < COOLDOWN_MS) return
@@ -192,6 +204,7 @@ class SkipAccessibilityService : AccessibilityService() {
         const val UNBIND_RECOVER_DELAY_MS = 1500L
         const val VERIFY_DELAY_MS = 800L
         const val MAX_RETRY = 2
+        const val SPLASH_WINDOW_MS = 8000L
 
         /** 系统包与噪声大户：直接跳过节点遍历（李跳跳同款"先粗筛再遍历"思路） */
         val PACKAGE_BLACKLIST = setOf(
