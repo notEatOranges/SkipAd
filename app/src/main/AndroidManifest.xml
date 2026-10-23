@@ -1,7 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- 隐私红线：不申请任何权限（含 INTERNET），所有识别与点击均在本地完成 -->
+    <!--
+      权限策略（隐私红线不变：无 INTERNET / 存储 / 位置，所有识别与点击均在本地完成）：
+      - RECEIVE_BOOT_COMPLETED / POST_NOTIFICATIONS：保活——开机恢复 + 掉线本地提醒，不读任何数据；
+      - WRITE_SECURE_SETTINGS：signature 级权限，正常安装拿不到、必须电脑 adb 手动授予，
+        仅用于把本 App 自己的无障碍服务写回系统设置（静默复活），属用户显式授权的运营性权限。
+    -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission
+        android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
 
     <application
         android:allowBackup="false"
@@ -32,5 +43,21 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config" />
         </service>
+
+        <!-- 保活：开机/升级兜底广播 + 15 分钟周期自检 Job -->
+        <receiver
+            android:name=".keepalive.BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <service
+            android:name=".keepalive.KeepAliveJobService"
+            android:exported="true"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
     </application>
 </manifest>

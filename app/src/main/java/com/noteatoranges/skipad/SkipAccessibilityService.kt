@@ -1,11 +1,13 @@
 package com.noteatoranges.skipad
 
 import android.accessibilityservice.AccessibilityService
+import android.content.Intent
 import android.os.SystemClock
 import android.view.accessibility.AccessibilityEvent
 import com.noteatoranges.skipad.core.BuiltinRules
 import com.noteatoranges.skipad.core.ClickPerformer
 import com.noteatoranges.skipad.core.NodeScanner
+import com.noteatoranges.skipad.keepalive.KeepAlive
 import com.noteatoranges.skipad.store.StatsStore
 
 /**
@@ -30,6 +32,21 @@ class SkipAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         scanner = NodeScanner(BuiltinRules.defaults())
         clicker = ClickPerformer(this)
+        // 连上系统的同时把保活 Job 确认到位，并留痕到日志环
+        KeepAlive.scheduleJob(this)
+        StatsStore.logEvent(this, getString(R.string.ka_log_connected))
+    }
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        // 被解绑（设置里被关 / 被 ROM 杀 / 覆盖安装）后的黄金几秒进程还活着：
+        // 延迟一点再自检，静默模式当场拉起，提醒模式立刻发通知。
+        // 冷却阀在 KeepAlive 里防震荡；本方法也会被两段式写入的中间态触发，届时 checkAndRecover 会识别"还在运行"直接返回。
+        val appContext = applicationContext
+        Thread {
+            SystemClock.sleep(UNBIND_RECOVER_DELAY_MS)
+            KeepAlive.checkAndRecover(appContext)
+        }.start()
+        return super.onUnbind(intent)
     }
 
     override fun onInterrupt() {
@@ -71,6 +88,7 @@ class SkipAccessibilityService : AccessibilityService() {
     private companion object {
         const val THROTTLE_MS = 150L
         const val COOLDOWN_MS = 4000L
+        const val UNBIND_RECOVER_DELAY_MS = 1500L
 
         /** 系统包与噪声大户：直接跳过节点遍历（李跳跳同款"先粗筛再遍历"思路） */
         val PACKAGE_BLACKLIST = setOf(
