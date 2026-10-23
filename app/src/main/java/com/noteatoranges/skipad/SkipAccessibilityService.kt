@@ -1,7 +1,12 @@
 package com.noteatoranges.skipad
 
 import android.accessibilityservice.AccessibilityService
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.graphics.Bitmap
+import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.os.Build
 import android.os.Handler
@@ -11,27 +16,35 @@ import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.noteatoranges.skipad.core.BuiltinRules
 import com.noteatoranges.skipad.core.ClickPerformer
 import com.noteatoranges.skipad.core.NodeScanner
+import com.noteatoranges.skipad.core.SkipRule
+import com.noteatoranges.skipad.db.RuleStore
+import com.noteatoranges.skipad.db.SnapshotStore
 import com.noteatoranges.skipad.db.StatsDb
 import com.noteatoranges.skipad.keepalive.KeepAlive
 import com.noteatoranges.skipad.store.StatsStore
 import java.io.File
+import java.util.concurrent.Executor
 
 /**
- * 核心无障碍服务：窗口事件 → 节点树匹配"跳过" → 模拟点击。
+ * 核心无障碍服务：窗口事件 → 规则匹配（用户规则优先，内置规则兜底）→ 模拟点击。
  *
- * 点击后验证制（0.4.1，0.4.3 强化）：广告 SDK 普遍不理会 ACTION_CLICK，
- * "performAction 返回 true"不等于跳过——800ms 后核验，**在所有窗口**（含 overlay
- * 悬浮窗，rootInActiveWindow 未必是广告层）里找目标：还在就 dispatchGesture 真实
- * 手势补刀（最多 2 次），全部窗口都找不到目标才记一次跳过。
- * 诊断：命中/核验/放弃时把完整控件树落盘 filesDir/diag/（adb run-as 可拉），
- * logcat TAG=SkipAdEngine（no-match 只打 VERBOSE 防刷屏）。
+ * - 点击后验证制：点击 800ms 后在**所有窗口**（含 overlay）重扫，目标还在就用真实手势补刀
+ *   （最多 2 次），目标消失才记一次跳过；
+ * - 用户规则（GKD 式）：快照点选生成的 node/point 规则优先于内置关键字；
+ * - 坐标点按兜底：无可读文本的广告 App 冷启动后朝右上角标准位真点；
+ * - 快照：常驻通知「抓取快照」按钮，截图+控件树落盘供点选生成规则；
+ * - 诊断：TAG=SkipAdEngine；控件树落盘 filesDir/diag/。
  */
 class SkipAccessibilityService : AccessibilityService() {
 
-    private var scanner: NodeScanner? = null
+    private var builtinScanner: NodeScanner? = null
+    private var userScanner: NodeScanner? = null
+    private var userRulesVersionSeen = -1
     private var clicker: ClickPerformer? = null
     private var lastHandleAt = 0L
 
@@ -41,14 +54,6 @@ class SkipAccessibilityService : AccessibilityService() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var pending: PendingSkip? = null
-    private var lastFgHandleAt = 0L
-
-    /** 每个 App 最近一次"新窗口出现"的时间：开屏广告只存在于启动后的几秒内，
-     *  超出 [SPLASH_WINDOW_MS] 的窗口（浏览器长驻页面等）不再扫描，防关键字空转误触 */
-    private val lastStateChangeAt = HashMap<String, Long>()
-
-    /** 每个 App 当前前台 Activity 类名（开屏页/广告 Activity 类名多含 splash/ad，用于点按闸） */
-    private val lastActivityClass = HashMap<String, String>()
 
     private data class PendingSkip(
         val windowKey: String,
@@ -57,14 +62,30 @@ class SkipAccessibilityService : AccessibilityService() {
         var attempts: Int,
     )
 
+    /** 每个 App 最近一次"新窗口出现"的时间与前台 Activity 类名 */
+    private val lastStateChangeAt = HashMap<String, Long>()
+    private val lastActivityClass = HashMap<String, String>()
+
+    private val mainExecutor = Executor { mainHandler.post(it) }
+
+    private val snapshotReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == ACTION_TAKE_SNAPSHOT) takeSnapshot()
+        }
+    }
+
     override fun onServiceConnected() {
         super.onServiceConnected()
-        scanner = NodeScanner(BuiltinRules.defaults())
+        builtinScanner = NodeScanner(BuiltinRules.defaults())
         clicker = ClickPerformer(this)
-        // 桌面动态拉黑：HOME 类应用里没有开屏广告，且桌面图标文字可能含 "skip"
         blacklist = PACKAGE_BLACKLIST + findHomePackages()
         KeepAlive.scheduleJob(this)
         StatsStore.logEvent(this, getString(R.string.ka_log_connected))
+        postWorkNotification()
+        registerReceiver(
+            snapshotReceiver, IntentFilter(ACTION_TAKE_SNAPSHOT),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
     }
 
     private fun findHomePackages(): Set<String> = try {
@@ -84,19 +105,20 @@ class SkipAccessibilityService : AccessibilityService() {
         return super.onUnbind(intent)
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        runCatching { unregisterReceiver(snapshotReceiver) }
+    }
+
     override fun onInterrupt() {}
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         event ?: return
         val type = event.eventType
-        if (Math.random() < 0.02) {
-            Log.v(TAG, "entry type=$type pkg=${event.packageName}")
-        }
 
         // —— 坐标点按调度（必须最先做）：冷启动切换瞬间 rootInActiveWindow 往往还是
         //    旧窗口/桌面，root 包名判定会误入黑名单分支；这里用 event.packageName（准）。
-        //    此路径只写 map，零开销，**不做时间节流**——桌面→App 切换常在 5ms 内连发，
-        //    一旦节流就会吞掉切换事件（0.5.1 实测被 300ms 阀吞掉导致坐标点按永不触发）——
+        //    此路径只写 map，零开销，不做时间节流（切换事件常在 4ms 内连发）——
         if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             val ep = event.packageName?.toString()
             if (ep != null && ep != packageName) {
@@ -104,7 +126,13 @@ class SkipAccessibilityService : AccessibilityService() {
                 val freshSwitch = lastFgPkg != ep && ep !in blacklist
                 lastStateChangeAt[ep] = SystemClock.elapsedRealtime()
                 event.className?.toString()?.let { lastActivityClass[ep] = it }
-                if (ep in CORNER_TAP_PKGS && freshSwitch) scheduleCornerTaps(ep)
+                if (freshSwitch && ep !in blacklist) {
+                    // 用户 point 规则优先
+                    RuleStore.pointRules(this).filter { it.app == ep }.forEach { r ->
+                        schedulePointTaps(ep, r.xRatio ?: 0.93f, r.yRatio ?: 0.065f, r.delayMs, "rule:${r.id}")
+                    }
+                    if (ep in CORNER_TAP_PKGS) scheduleCornerTaps(ep)
+                }
                 lastFgPkg = ep
             }
         }
@@ -121,33 +149,45 @@ class SkipAccessibilityService : AccessibilityService() {
         val pkg = root.packageName?.toString() ?: event.packageName?.toString() ?: return
         if (pkg in blacklist || pkg == packageName) return
 
-        // 启动窗口闸：只在"新窗口出现后 SPLASH_WINDOW_MS 内"扫描（开屏广告只在这段时间存在）
+        // 启动窗口闸：只在"新窗口出现后 SPLASH_WINDOW_MS 内"扫描
         val stateAt = lastStateChangeAt[pkg] ?: 0L
         if (now - stateAt > SPLASH_WINDOW_MS) return
 
-        val windowKey = "$pkg/${event.className ?: root.className ?: ""}"
-        if (windowKey == lastSkipWindow && now - lastSkipAt < COOLDOWN_MS) return
+        // 刷新用户规则扫描器（版本变化才重建）
+        val ver = RuleStore.version(this)
+        if (ver != userRulesVersionSeen) {
+            userRulesVersionSeen = ver
+            val nodeRules = RuleStore.nodeRulesAsScannerRules(this)
+            userScanner = if (nodeRules.isEmpty()) null else NodeScanner(nodeRules)
+        }
 
-        val hit = scanner?.findSkipTarget(root, resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels)
+        val w = resources.displayMetrics.widthPixels
+        val h = resources.displayMetrics.heightPixels
+        // 用户规则优先
+        val hit = userScanner?.findSkipTarget(root, w, h)
+            ?: builtinScanner?.findSkipTarget(root, w, h)
         if (hit == null) {
-            // 逐窗扫描刷屏严重，no-match 降为 VERBOSE
-            Log.v(TAG, "scan $pkg: ${scanner?.lastDebug}")
+            Log.v(TAG, "scan $pkg: ${userScanner?.lastDebug ?: builtinScanner?.lastDebug}")
             return
         }
         val detail = hit.first.text?.toString()
             ?: hit.first.contentDescription?.toString()
+            ?: hit.first.viewIdResourceName
             ?: hit.second.id
-        Log.d(TAG, "match $pkg: ${scanner?.lastDebug}")
+        Log.d(TAG, "match $pkg: ${userScanner?.lastDebug ?: builtinScanner?.lastDebug}")
         dumpTree(root, pkg, "match")
 
         if (clicker?.click(hit.first) == true) {
-            lastSkipWindow = windowKey
+            lastSkipWindow = windowKeyFor(pkg, event, root)
             lastSkipAt = now
-            pending = PendingSkip(windowKey, pkg, detail, 0)
+            pending = PendingSkip(lastSkipWindow ?: "", pkg, detail, 0)
             val token = pending
             mainHandler.postDelayed({ if (pending === token) verifySkip() }, VERIFY_DELAY_MS)
         }
     }
+
+    private fun windowKeyFor(pkg: String, event: AccessibilityEvent, root: AccessibilityNodeInfo): String =
+        "$pkg/${event.className ?: root.className ?: ""}"
 
     /** 核验：所有窗口（含 overlay）都找不到目标才算跳过成功，否则手势补刀 */
     private fun verifySkip() {
@@ -170,12 +210,12 @@ class SkipAccessibilityService : AccessibilityService() {
         found.first.getBoundsInScreen(rect)
         if (!rect.isEmpty) {
             val ok = clicker?.clickPoint(rect.exactCenterX(), rect.exactCenterY()) ?: false
-            Log.d(TAG, "retry#${p.attempts} ${p.pkg} gesture ok=$ok at (${rect.exactCenterX().toInt()},${rect.exactCenterY().toInt()}) win=${found.second}")
+            Log.d(TAG, "retry#${p.attempts} ${p.pkg} gesture ok=$ok win=${found.second}")
         }
         mainHandler.postDelayed({ if (pending === p) verifySkip() }, VERIFY_DELAY_MS)
     }
 
-    /** 在所有可交互窗口里找跳过目标（rootInActiveWindow 未必是广告 overlay 层） */
+    /** 在所有可交互窗口里找跳过目标（用户规则 + 内置规则，rootInActiveWindow 未必是广告层） */
     private fun findTargetInAnyWindow(): Triple<AccessibilityNodeInfo, String, String>? {
         val w = resources.displayMetrics.widthPixels
         val h = resources.displayMetrics.heightPixels
@@ -183,18 +223,148 @@ class SkipAccessibilityService : AccessibilityService() {
             val root = window.root ?: continue
             val wp = root.packageName?.toString() ?: continue
             if (wp == packageName || wp in blacklist) continue
-            val hit = scanner?.findSkipTarget(root, w, h)
+            val hit = userScanner?.findSkipTarget(root, w, h)
+                ?: builtinScanner?.findSkipTarget(root, w, h)
             if (hit != null) return Triple(hit.first, wp, "win#${window.id} ${window.type}")
         }
         return null
     }
 
-    /** 完整控件树落盘（诊断广告页真实层级：文本/viewId/可点击/坐标） */
+    // ———————— 坐标点按 ————————
+
+    private fun schedulePointTaps(pkg: String, xRatio: Float, yRatio: Float, delayMs: Long, tag: String) {
+        listOf(delayMs, delayMs + 1000).forEach { d ->
+            mainHandler.postDelayed({
+                val root = rootInActiveWindow ?: return@postDelayed
+                if (root.packageName?.toString() != pkg) return@postDelayed
+                val ok = clicker?.clickPoint(
+                    resources.displayMetrics.widthPixels * xRatio,
+                    resources.displayMetrics.heightPixels * yRatio,
+                ) ?: false
+                Log.d(TAG, "point $tag $pkg ok=$ok (${(xRatio * 100).toInt()}%,${(yRatio * 100).toInt()}%)")
+            }, d)
+        }
+    }
+
+    private fun scheduleCornerTaps(pkg: String) {
+        Log.d(TAG, "corner scheduled $pkg")
+        CORNER_TAP_DELAYS.forEachIndexed { i, delay ->
+            mainHandler.postDelayed({
+                val root = rootInActiveWindow ?: return@postDelayed
+                if (root.packageName?.toString() != pkg) return@postDelayed
+                val actCls = lastActivityClass[pkg] ?: ""
+                if (!actCls.contains("ad", true) && !actCls.contains("splash", true) &&
+                    !actCls.contains("launch", true)
+                ) {
+                    Log.d(TAG, "corner#${i + 1} $pkg skip: 非广告/开屏窗口(act=$actCls)")
+                    return@postDelayed
+                }
+                val ok = clicker?.clickPoint(
+                    resources.displayMetrics.widthPixels * CORNER_X_RATIO,
+                    resources.displayMetrics.heightPixels * CORNER_Y_RATIO,
+                ) ?: false
+                Log.d(TAG, "corner#${i + 1} $pkg ok=$ok act=$actCls")
+            }, delay)
+        }
+    }
+
+    // ———————— 快照 ————————
+
+    private fun postWorkNotification() {
+        val pi = android.app.PendingIntent.getBroadcast(
+            this, 0,
+            Intent(ACTION_TAKE_SNAPSHOT).setPackage(packageName),
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE,
+        )
+        val n = NotificationCompat.Builder(this, SNAP_CHANNEL)
+            .setSmallIcon(R.drawable.ic_stat_keepalive)
+            .setContentTitle(getString(R.string.snap_notif_title))
+            .setContentText(getString(R.string.snap_notif_text))
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .addAction(0, getString(R.string.snap_action), pi)
+            .build()
+        try {
+            val nm = androidx.core.app.NotificationManagerCompat.from(this)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                (getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager)
+                    .createNotificationChannel(
+                        android.app.NotificationChannel(
+                            SNAP_CHANNEL, getString(R.string.snap_channel), android.app.NotificationManager.IMPORTANCE_LOW
+                        )
+                    )
+            }
+            nm.notify(SNAP_NOTIF_ID, n)
+        } catch (e: SecurityException) {
+        }
+    }
+
+    /** 抓快照：截图 + 控件树 JSON 落盘（GKD 同款），供点选生成规则 */
+    private fun takeSnapshot() {
+        val root = rootInActiveWindow ?: return
+        val pkg = root.packageName?.toString() ?: return
+        val act = lastActivityClass[pkg] ?: ""
+        val w = resources.displayMetrics.widthPixels
+        val h = resources.displayMetrics.heightPixels
+        val nodes = ArrayList<SnapshotStore.Node>(400)
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var idx = 0
+        while (queue.isNotEmpty() && idx < 400) {
+            val node = queue.removeFirst()
+            idx++
+            val r = Rect()
+            node.getBoundsInScreen(r)
+            nodes.add(
+                SnapshotStore.Node(
+                    idx, node.className?.toString() ?: "",
+                    node.text?.toString() ?: "", node.contentDescription?.toString() ?: "",
+                    node.viewIdResourceName ?: "", node.isClickable,
+                    r.left, r.top, r.right, r.bottom,
+                )
+            )
+            for (i in 0 until node.childCount) node.getChild(i)?.let(queue::add)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            takeScreenshot(android.view.Display.DEFAULT_DISPLAY, mainExecutor,
+                object : TakeScreenshotCallback() {
+                    override fun onResult(bitmap: Bitmap?) {
+                        val dir = SnapshotStore.save(applicationContext, pkg, act, nodes, bitmap)
+                        StatsStore.logEvent(applicationContext, "快照已保存：$pkg（${nodes.size} 节点）")
+                        Log.d(TAG, "snapshot saved ${dir.path}")
+                    }
+                })
+        } else {
+            val dir = SnapshotStore.save(applicationContext, pkg, act, nodes, null)
+            StatsStore.logEvent(applicationContext, "快照已保存：$pkg（${nodes.size} 节点，无截图）")
+        }
+    }
+
+    /** takeScreenshot 回调适配（API 30+），HardwareBuffer 转 Bitmap */
+    private abstract class TakeScreenshotCallback :
+        AccessibilityService.TakeScreenshotCallback {
+        override fun onFailure(errorCode: Int) {
+            Log.w("SkipAdEngine", "takeScreenshot failed: $errorCode")
+        }
+
+        override fun onSuccess(screenshot: AccessibilityService.ScreenshotResult) {
+            val hw = android.graphics.Bitmap.wrapHardwareBuffer(
+                screenshot.hardwareBuffer, screenshot.colorSpace
+            )
+            val bitmap = hw?.copy(Bitmap.Config.ARGB_8888, false)
+            screenshot.hardwareBuffer.close()
+            onResult(bitmap)
+        }
+
+        abstract fun onResult(bitmap: Bitmap?)
+    }
+
+    // ———————— ————————
+
     private fun dumpTree(root: AccessibilityNodeInfo?, pkg: String, tag: String) {
         root ?: return
         try {
             val dir = File(filesDir, "diag").apply { mkdirs() }
-            // 只留最近 20 份
             dir.listFiles()?.sortedBy { it.name }?.dropLast(20)?.forEach { it.delete() }
             val sb = StringBuilder()
             sb.append("== $tag $pkg ${System.currentTimeMillis()} ==\n")
@@ -219,33 +389,6 @@ class SkipAccessibilityService : AccessibilityService() {
         }
     }
 
-    /** 冷启动切入后按延迟依次真点右上角（跳过按钮标准位）；期间离开该 App 自动作废。
-     *  每次点按前验"广告在场"：当前窗口类名含 splash/ad（开屏页或广告 SDK Activity）才真点，
-     *  普通页面（无广告的冷启动）零误触。 */
-    private fun scheduleCornerTaps(pkg: String) {
-        Log.d(TAG, "corner scheduled $pkg")
-        CORNER_TAP_DELAYS.forEachIndexed { i, delay ->
-            mainHandler.postDelayed({
-                val root = rootInActiveWindow ?: return@postDelayed
-                if (root.packageName?.toString() != pkg) return@postDelayed
-                // 广告在场闸：看前台 Activity 类名（window.root.className 是根视图类名，恒为
-                // FrameLayout 之类，永远不含 splash/ad——0.5.3 实测闸门全拦的坑）
-                val actCls = lastActivityClass[pkg] ?: ""
-                if (!actCls.contains("ad", true) && !actCls.contains("splash", true) &&
-                    !actCls.contains("launch", true)
-                ) {
-                    Log.d(TAG, "corner#${i + 1} $pkg skip: 非广告/开屏窗口(act=$actCls)")
-                    return@postDelayed
-                }
-                val ok = clicker?.clickPoint(
-                    resources.displayMetrics.widthPixels * CORNER_X_RATIO,
-                    resources.displayMetrics.heightPixels * CORNER_Y_RATIO,
-                ) ?: false
-                Log.d(TAG, "corner#${i + 1} $pkg ok=$ok act=$actCls")
-            }, delay)
-        }
-    }
-
     private companion object {
         const val TAG = "SkipAdEngine"
         const val THROTTLE_MS = 150L
@@ -254,11 +397,12 @@ class SkipAccessibilityService : AccessibilityService() {
         const val VERIFY_DELAY_MS = 800L
         const val MAX_RETRY = 2
         const val SPLASH_WINDOW_MS = 8000L
-        const val FG_THROTTLE_MS = 300L
         const val CORNER_X_RATIO = 0.93f
         const val CORNER_Y_RATIO = 0.065f
+        const val SNAP_CHANNEL = "snapshot"
+        const val SNAP_NOTIF_ID = 2001
+        const val ACTION_TAKE_SNAPSHOT = "com.noteatoranges.skipad.TAKE_SNAPSHOT"
 
-        /** 跳过按钮无可读文本的广告 App：启用右上角坐标点按（切 ApP 冷启动后 0.9/1.9/2.9s 各点一下） */
         val CORNER_TAP_PKGS = setOf(
             "com.coolapk.market",
             "com.netease.mail",

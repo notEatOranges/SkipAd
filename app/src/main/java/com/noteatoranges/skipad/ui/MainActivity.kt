@@ -112,6 +112,9 @@ class MainActivity : AppCompatActivity() {
         findViewById<TextView>(R.id.recent_entry).setOnClickListener {
             startActivity(Intent(this, RecentActivity::class.java))
         }
+        findViewById<TextView>(R.id.rules_entry).setOnClickListener {
+            startActivity(Intent(this, RulesActivity::class.java))
+        }
 
         // —— 设置 ——
         batteryButton.setOnClickListener { requestIgnoreBatteryOptimization() }
