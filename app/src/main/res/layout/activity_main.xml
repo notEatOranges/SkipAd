@@ -10,11 +10,17 @@
         android:layout_height="0dp" />
 
     <FrameLayout
+        android:id="@+id/content_frame"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1">
 
         <!-- ======== Tab 1：首页 ======== -->
+        <FrameLayout
+            android:id="@+id/blur_content"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent">
+
         <ScrollView
             android:id="@+id/page_home"
             android:layout_width="match_parent"
@@ -562,8 +568,10 @@
             </LinearLayout>
         </ScrollView>
 
-        <!-- 悬浮 Tab 栏 -->
-        <LinearLayout
+        </FrameLayout>
+
+        <!-- 悬浮玻璃 Tab 栏（快照自模糊） -->
+        <com.noteatoranges.skipad.util.GlassBarView
             android:id="@+id/tab_bar"
             android:layout_width="0dp"
             android:layout_height="52dp"
@@ -614,6 +622,6 @@
                 android:text="@string/tab_about"
                 android:textColor="@color/text_secondary"
                 android:textSize="14sp" />
-        </LinearLayout>
+        </com.noteatoranges.skipad.util.GlassBarView>
     </FrameLayout>
 </LinearLayout>

@@ -30,7 +30,7 @@ import com.noteatoranges.skipad.db.StatsDb
 import com.noteatoranges.skipad.keepalive.KeepAlive
 import com.noteatoranges.skipad.store.StatsStore
 import com.noteatoranges.skipad.util.AppLabels
-import com.noteatoranges.skipad.util.GlassTabBar
+import com.noteatoranges.skipad.util.GlassBarView
 import com.noteatoranges.skipad.util.Ui
 import java.util.Locale
 
@@ -56,9 +56,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var notifStatus: TextView
     private lateinit var notifButton: Button
     private lateinit var kaLogText: TextView
-    private lateinit var tabBar: LinearLayout
+    private lateinit var tabBar: GlassBarView
 
-    private var glassTabs: GlassTabBar? = null
     private var bottomInsetPx = 0
     private var currentTab = 0
 
@@ -80,26 +79,8 @@ class MainActivity : AppCompatActivity() {
         notifButton = findViewById(R.id.notif_button)
         kaLogText = findViewById(R.id.ka_log_text)
         tabBar = findViewById(R.id.tab_bar)
-
-        // 真·玻璃 Tab 栏（子窗口 + 系统模糊，31+）；兜底底色先挂上，玻璃就绪后再隐藏普通栏
-        tabBar.setBackgroundResource(R.drawable.bg_tabbar)
-        if (Build.VERSION.SDK_INT >= 31) {
-            val bar = GlassTabBar(
-                this,
-                listOf(
-                    getString(R.string.tab_home),
-                    getString(R.string.tab_settings),
-                    getString(R.string.tab_about),
-                )
-            ) { idx -> selectTab(idx) }
-            bar.onAvailable = {
-                glassTabs = bar
-                tabBar.visibility = View.GONE
-                bar.setBottomInset(bottomInsetPx)
-                bar.setSelected(currentTab)
-            }
-            bar.create()
-        }
+        // 玻璃：把内容层（本栏的兄弟节点）指定为模糊目标
+        tabBar.setup(findViewById(R.id.blur_content))
 
         pages = listOf(findViewById(R.id.page_home), findViewById(R.id.page_settings), findViewById(R.id.page_about))
         tabs = listOf(findViewById(R.id.tab_home), findViewById(R.id.tab_settings), findViewById(R.id.tab_about))
@@ -108,14 +89,11 @@ class MainActivity : AppCompatActivity() {
         // 沉浸式 + 底部安全区：内容滚到手势条底下，玻璃 Tab 栏浮在其上
         Ui.edgeToEdge(this, findViewById(R.id.inset_top)) { bottom ->
             bottomInsetPx = bottom
-            if (glassTabs == null) {
-                tabBar.layoutParams = (tabBar.layoutParams as FrameLayout.LayoutParams).apply {
-                    bottomMargin = bottom + dp(14)
-                    width = glassWidth()
-                }
-                tabBar.requestLayout()
+            tabBar.layoutParams = (tabBar.layoutParams as FrameLayout.LayoutParams).apply {
+                bottomMargin = bottom + dp(14)
+                width = glassWidth()
             }
-            glassTabs?.setBottomInset(bottom)
+            tabBar.requestLayout()
             pages.forEach { p ->
                 (p as ViewGroup).getChildAt(0).setPadding(
                     dp(20), 0, dp(20), dp(96) + bottom
@@ -173,11 +151,6 @@ class MainActivity : AppCompatActivity() {
         refresh()
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        glassTabs?.dismiss()
-    }
-
     private fun glassWidth(): Int =
         minOf(dp(300), resources.displayMetrics.widthPixels - dp(40))
 
@@ -191,7 +164,6 @@ class MainActivity : AppCompatActivity() {
             t.setTextColor(getColor(if (i == index) R.color.primary else R.color.text_secondary))
             t.isActivated = i == index
         }
-        glassTabs?.setSelected(index)
     }
 
     private fun refresh() {

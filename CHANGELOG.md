@@ -2,6 +2,25 @@
 
 > 规矩：每轮修改必须记录（改了什么/为什么/影响面/踩坑），换电脑先读本文件再动手。
 
+## 0.4.2 - 2026-10-23 · 玻璃 Tab 栏重做：快照自模糊（不依赖 ROM 开关）
+
+**改了什么**
+- `GlassTabBar`（子窗口 blurBehind）**废弃**——真机上系统跨窗口模糊静默不渲染，用户看到的只是 65% 白透明贴片，设置页文字从后面透上来糊成一片（用户实测差评："明明就是透明效果"）；
+- 新方案 `GlassBarView`（**快照自模糊，BlurView 库同款原理**）：挂在内容层 OnPreDraw 上，每帧把内容层 1/8 缩微截屏 → CPU 盒式模糊×3 → 放大垫底，叠 70% 白 + 圆角裁剪 + 描边；不依赖任何 ROM 模糊开关，效果全设备一致；继承 LinearLayout，三个 Tab 文字 weight 平分浮在玻璃上；
+- 布局：三个页面 ScrollView 包进独立 `blur_content` 容器作模糊目标（**目标绝不能包含玻璃栏自己，否则 draw 自递归 StackOverflow**——首版实测）；
+- 版本 0.4.2 / versionCode 7。
+
+**为什么**
+- 用户令：Tab 栏必须是真磨砂玻璃（酷安观感），透明贴片不算数；0.4.0 的子窗口方案在荣耀上没效果。
+
+**影响面**
+- 滚动期间每帧多一次内容层小区域绘制 + 百余像素的模糊，实测设置页长列表滚动流畅；玻璃栏必须为 `blur_content` 的兄弟节点。
+
+**踩坑/备注**
+- 首版把模糊目标设成含玻璃栏自己的 content_frame → `GlassBarView.onDraw` 里 `target.draw()` 无限自递归，StackOverflowError 启动即崩（logcat 栈里全是 onDraw 互调）；
+- 玻璃栏从 LinearLayout 换 FrameLayout 时，子 Tab 文字的 `layout_width=0dp + weight` 失效 → 零宽全隐身（截图文字消失），改回继承 LinearLayout 解决；
+- 手动安装的 platform-37 已随 0.4.0 就位，compileSdk 37 保留，为将来真上 `SurfaceView.setBlurRegions` 留着（那需要独立玻璃面板 overlay 场景）。
+
 ## 0.4.1 - 2026-10-23 · 点击后验证制 + 手势补刀 + 全链路诊断日志（修"记录了但没跳过"）
 
 **改了什么**
