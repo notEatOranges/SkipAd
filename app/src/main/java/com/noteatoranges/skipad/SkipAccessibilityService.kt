@@ -8,22 +8,25 @@ import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import com.noteatoranges.skipad.core.BuiltinRules
 import com.noteatoranges.skipad.core.ClickPerformer
 import com.noteatoranges.skipad.core.NodeScanner
 import com.noteatoranges.skipad.db.StatsDb
 import com.noteatoranges.skipad.keepalive.KeepAlive
 import com.noteatoranges.skipad.store.StatsStore
+import java.io.File
 
 /**
  * 核心无障碍服务：窗口事件 → 节点树匹配"跳过" → 模拟点击。
  *
- * 性能与稳定性设计（完整论证见 docs/design.md §3）：
- * - 事件节流 + 包名黑名单（静态系统包 + 动态 HOME 桌面）+ 会话冷却；
- * - **点击后验证制（0.4.1）**：国产广告 SDK 普遍不理会 ACTION_CLICK（只认真实触摸），
- *   "performAction 返回 true"不等于广告被跳过——800ms 后重扫窗口，目标还在就改用
- *   dispatchGesture 真实手势补刀（最多 2 次），**广告真消失才记一次跳过**；
- * - 用 rootInActiveWindow 而非 event.source；全链路诊断日志打 TAG=SkipAdEngine。
+ * 点击后验证制（0.4.1，0.4.3 强化）：广告 SDK 普遍不理会 ACTION_CLICK，
+ * "performAction 返回 true"不等于跳过——800ms 后核验，**在所有窗口**（含 overlay
+ * 悬浮窗，rootInActiveWindow 未必是广告层）里找目标：还在就 dispatchGesture 真实
+ * 手势补刀（最多 2 次），全部窗口都找不到目标才记一次跳过。
+ * 诊断：命中/核验/放弃时把完整控件树落盘 filesDir/diag/（adb run-as 可拉），
+ * logcat TAG=SkipAdEngine（no-match 只打 VERBOSE 防刷屏）。
  */
 class SkipAccessibilityService : AccessibilityService() {
 
@@ -48,10 +51,8 @@ class SkipAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         scanner = NodeScanner(BuiltinRules.defaults())
         clicker = ClickPerformer(this)
-        // 桌面动态拉黑：HOME 类应用（含厂商桌面）里没有开屏广告，且桌面图标文字
-        // 可能含 "skip"（比如本 App 自己的图标），不拉黑会把图标当跳过按钮点掉
+        // 桌面动态拉黑：HOME 类应用里没有开屏广告，且桌面图标文字可能含 "skip"
         blacklist = PACKAGE_BLACKLIST + findHomePackages()
-        // 连上系统的同时把保活 Job 确认到位，并留痕到日志环
         KeepAlive.scheduleJob(this)
         StatsStore.logEvent(this, getString(R.string.ka_log_connected))
     }
@@ -65,9 +66,6 @@ class SkipAccessibilityService : AccessibilityService() {
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
-        // 被解绑（设置里被关 / 被 ROM 杀 / 覆盖安装）后的黄金几秒进程还活着：
-        // 延迟一点再自检，静默模式当场拉起，提醒模式立刻发通知。
-        // 冷却阀在 KeepAlive 里防震荡；本方法也会被两段式写入的中间态触发，届时 checkAndRecover 会识别"还在运行"直接返回。
         val appContext = applicationContext
         Thread {
             SystemClock.sleep(UNBIND_RECOVER_DELAY_MS)
@@ -76,9 +74,7 @@ class SkipAccessibilityService : AccessibilityService() {
         return super.onUnbind(intent)
     }
 
-    override fun onInterrupt() {
-        // 无语音反馈场景，无需处理
-    }
+    override fun onInterrupt() {}
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         event ?: return
@@ -100,13 +96,15 @@ class SkipAccessibilityService : AccessibilityService() {
 
         val hit = scanner?.findSkipTarget(root, resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels)
         if (hit == null) {
-            Log.d(TAG, "scan $pkg: ${scanner?.lastDebug}")
+            // 逐窗扫描刷屏严重，no-match 降为 VERBOSE
+            Log.v(TAG, "scan $pkg: ${scanner?.lastDebug}")
             return
         }
         val detail = hit.first.text?.toString()
             ?: hit.first.contentDescription?.toString()
             ?: hit.second.id
         Log.d(TAG, "match $pkg: ${scanner?.lastDebug}")
+        dumpTree(root, pkg, "match")
 
         if (clicker?.click(hit.first) == true) {
             lastSkipWindow = windowKey
@@ -117,35 +115,74 @@ class SkipAccessibilityService : AccessibilityService() {
         }
     }
 
-    /** 点击后核验：目标还在就手势补刀，真消失才记账 */
+    /** 核验：所有窗口（含 overlay）都找不到目标才算跳过成功，否则手势补刀 */
     private fun verifySkip() {
         val p = pending ?: return
-        val root = rootInActiveWindow
-        val hit = root?.let { r ->
-            scanner?.findSkipTarget(r, resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels)
-        }
-        val curPkg = root?.packageName?.toString()
-        // 消失判定：窗口没了 / 扫不到目标 / 换了 App（重扫 className 与事件 className 不可比，勿比）
-        val gone = root == null || hit == null || curPkg != p.pkg
-        if (gone) {
+        val found = findTargetInAnyWindow()
+        if (found == null) {
             StatsDb.get(this).insert(p.pkg, p.detail)
             Log.d(TAG, "verified ${p.pkg} 「${p.detail}」 (attempts=${p.attempts})")
             pending = null
             return
         }
         if (p.attempts >= MAX_RETRY) {
-            Log.d(TAG, "giveup ${p.pkg} 「${p.detail}」广告仍在, 已补刀${p.attempts}次不记账")
+            Log.d(TAG, "giveup ${p.pkg} 「${p.detail}」广告仍在(${found.second}), 已补刀${p.attempts}次不记账")
+            dumpTree(rootInActiveWindow, p.pkg, "giveup")
             pending = null
             return
         }
         p.attempts++
         val rect = Rect()
-        hit!!.first.getBoundsInScreen(rect)
+        found.first.getBoundsInScreen(rect)
         if (!rect.isEmpty) {
             val ok = clicker?.clickPoint(rect.exactCenterX(), rect.exactCenterY()) ?: false
-            Log.d(TAG, "retry#${p.attempts} ${p.pkg} gesture ok=$ok at (${rect.exactCenterX().toInt()},${rect.exactCenterY().toInt()})")
+            Log.d(TAG, "retry#${p.attempts} ${p.pkg} gesture ok=$ok at (${rect.exactCenterX().toInt()},${rect.exactCenterY().toInt()}) win=${found.second}")
         }
         mainHandler.postDelayed({ if (pending === p) verifySkip() }, VERIFY_DELAY_MS)
+    }
+
+    /** 在所有可交互窗口里找跳过目标（rootInActiveWindow 未必是广告 overlay 层） */
+    private fun findTargetInAnyWindow(): Triple<AccessibilityNodeInfo, String, String>? {
+        val w = resources.displayMetrics.widthPixels
+        val h = resources.displayMetrics.heightPixels
+        for (window in windows) {
+            val root = window.root ?: continue
+            val wp = root.packageName?.toString() ?: continue
+            if (wp == packageName || wp in blacklist) continue
+            val hit = scanner?.findSkipTarget(root, w, h)
+            if (hit != null) return Triple(hit.first, wp, "win#${window.id} ${window.type}")
+        }
+        return null
+    }
+
+    /** 完整控件树落盘（诊断广告页真实层级：文本/viewId/可点击/坐标） */
+    private fun dumpTree(root: AccessibilityNodeInfo?, pkg: String, tag: String) {
+        root ?: return
+        try {
+            val dir = File(filesDir, "diag").apply { mkdirs() }
+            // 只留最近 20 份
+            dir.listFiles()?.sortedBy { it.name }?.dropLast(20)?.forEach { it.delete() }
+            val sb = StringBuilder()
+            sb.append("== $tag $pkg ${System.currentTimeMillis()} ==\n")
+            for ((i, win) in windows.withIndex()) {
+                sb.append("win#$i id=${win.id} type=${win.type} pkg=${win.root?.packageName} active=${win.isActive} focused=${win.isFocused}\n")
+            }
+            val queue = ArrayDeque<AccessibilityNodeInfo>()
+            queue.add(root)
+            var n = 0
+            while (queue.isNotEmpty() && n < 300) {
+                val node = queue.removeFirst()
+                n++
+                val r = Rect()
+                node.getBoundsInScreen(r)
+                sb.append("[$n] ${node.className} txt=${node.text?.toString()?.take(30)} desc=${node.contentDescription?.toString()?.take(30)} " +
+                    "id=${node.viewIdResourceName} click=${node.isClickable} bounds=$r\n")
+                for (i in 0 until node.childCount) node.getChild(i)?.let(queue::add)
+            }
+            File(dir, "${tag}_${System.currentTimeMillis()}.txt").writeText(sb.toString())
+        } catch (e: Exception) {
+            Log.w(TAG, "dumpTree failed", e)
+        }
     }
 
     private companion object {
