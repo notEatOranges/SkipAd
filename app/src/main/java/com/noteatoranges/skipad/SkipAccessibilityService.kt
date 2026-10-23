@@ -3,6 +3,7 @@ package com.noteatoranges.skipad
 import android.accessibilityservice.AccessibilityService
 import android.content.Intent
 import android.graphics.Rect
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -36,13 +37,18 @@ class SkipAccessibilityService : AccessibilityService() {
 
     private var lastSkipWindow: String? = null
     private var lastSkipAt = 0L
+    private var lastFgPkg: String? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var pending: PendingSkip? = null
+    private var lastFgHandleAt = 0L
 
     /** 每个 App 最近一次"新窗口出现"的时间：开屏广告只存在于启动后的几秒内，
      *  超出 [SPLASH_WINDOW_MS] 的窗口（浏览器长驻页面等）不再扫描，防关键字空转误触 */
     private val lastStateChangeAt = HashMap<String, Long>()
+
+    /** 每个 App 当前前台 Activity 类名（开屏页/广告 Activity 类名多含 splash/ad，用于点按闸） */
+    private val lastActivityClass = HashMap<String, String>()
 
     private data class PendingSkip(
         val windowKey: String,
@@ -83,6 +89,26 @@ class SkipAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         event ?: return
         val type = event.eventType
+        if (Math.random() < 0.02) {
+            Log.v(TAG, "entry type=$type pkg=${event.packageName}")
+        }
+
+        // —— 坐标点按调度（必须最先做）：冷启动切换瞬间 rootInActiveWindow 往往还是
+        //    旧窗口/桌面，root 包名判定会误入黑名单分支；这里用 event.packageName（准）。
+        //    此路径只写 map，零开销，**不做时间节流**——桌面→App 切换常在 5ms 内连发，
+        //    一旦节流就会吞掉切换事件（0.5.1 实测被 300ms 阀吞掉导致坐标点按永不触发）——
+        if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            val ep = event.packageName?.toString()
+            if (ep != null && ep != packageName) {
+                if (lastStateChangeAt.size > 50) lastStateChangeAt.clear()
+                val freshSwitch = lastFgPkg != ep && ep !in blacklist
+                lastStateChangeAt[ep] = SystemClock.elapsedRealtime()
+                event.className?.toString()?.let { lastActivityClass[ep] = it }
+                if (ep in CORNER_TAP_PKGS && freshSwitch) scheduleCornerTaps(ep)
+                lastFgPkg = ep
+            }
+        }
+
         if (type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
         ) return
@@ -95,10 +121,6 @@ class SkipAccessibilityService : AccessibilityService() {
         val pkg = root.packageName?.toString() ?: event.packageName?.toString() ?: return
         if (pkg in blacklist || pkg == packageName) return
 
-        if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            if (lastStateChangeAt.size > 50) lastStateChangeAt.clear()
-            lastStateChangeAt[pkg] = now
-        }
         // 启动窗口闸：只在"新窗口出现后 SPLASH_WINDOW_MS 内"扫描（开屏广告只在这段时间存在）
         val stateAt = lastStateChangeAt[pkg] ?: 0L
         if (now - stateAt > SPLASH_WINDOW_MS) return
@@ -197,6 +219,33 @@ class SkipAccessibilityService : AccessibilityService() {
         }
     }
 
+    /** 冷启动切入后按延迟依次真点右上角（跳过按钮标准位）；期间离开该 App 自动作废。
+     *  每次点按前验"广告在场"：当前窗口类名含 splash/ad（开屏页或广告 SDK Activity）才真点，
+     *  普通页面（无广告的冷启动）零误触。 */
+    private fun scheduleCornerTaps(pkg: String) {
+        Log.d(TAG, "corner scheduled $pkg")
+        CORNER_TAP_DELAYS.forEachIndexed { i, delay ->
+            mainHandler.postDelayed({
+                val root = rootInActiveWindow ?: return@postDelayed
+                if (root.packageName?.toString() != pkg) return@postDelayed
+                // 广告在场闸：看前台 Activity 类名（window.root.className 是根视图类名，恒为
+                // FrameLayout 之类，永远不含 splash/ad——0.5.3 实测闸门全拦的坑）
+                val actCls = lastActivityClass[pkg] ?: ""
+                if (!actCls.contains("ad", true) && !actCls.contains("splash", true) &&
+                    !actCls.contains("launch", true)
+                ) {
+                    Log.d(TAG, "corner#${i + 1} $pkg skip: 非广告/开屏窗口(act=$actCls)")
+                    return@postDelayed
+                }
+                val ok = clicker?.clickPoint(
+                    resources.displayMetrics.widthPixels * CORNER_X_RATIO,
+                    resources.displayMetrics.heightPixels * CORNER_Y_RATIO,
+                ) ?: false
+                Log.d(TAG, "corner#${i + 1} $pkg ok=$ok act=$actCls")
+            }, delay)
+        }
+    }
+
     private companion object {
         const val TAG = "SkipAdEngine"
         const val THROTTLE_MS = 150L
@@ -205,6 +254,17 @@ class SkipAccessibilityService : AccessibilityService() {
         const val VERIFY_DELAY_MS = 800L
         const val MAX_RETRY = 2
         const val SPLASH_WINDOW_MS = 8000L
+        const val FG_THROTTLE_MS = 300L
+        const val CORNER_X_RATIO = 0.93f
+        const val CORNER_Y_RATIO = 0.065f
+
+        /** 跳过按钮无可读文本的广告 App：启用右上角坐标点按（切 ApP 冷启动后 0.9/1.9/2.9s 各点一下） */
+        val CORNER_TAP_PKGS = setOf(
+            "com.coolapk.market",
+            "com.netease.mail",
+            "com.ehai",
+        )
+        val CORNER_TAP_DELAYS = longArrayOf(900L, 1900L, 2900L)
 
         /** 系统包与噪声大户：直接跳过节点遍历（李跳跳同款"先粗筛再遍历"思路） */
         val PACKAGE_BLACKLIST = setOf(
