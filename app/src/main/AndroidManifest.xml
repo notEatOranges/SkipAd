@@ -35,6 +35,8 @@
         <activity android:name=".ui.RecentActivity" android:exported="false" />
         <activity android:name=".ui.RulesActivity" android:exported="false" />
         <activity android:name=".ui.SnapshotDetailActivity" android:exported="false" />
+        <activity android:name=".ui.KeepAliveSettingsActivity" android:exported="false" />
+        <activity android:name=".ui.MaintenanceActivity" android:exported="false" />
 
         <service
             android:name=".SkipAccessibilityService"

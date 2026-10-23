@@ -82,6 +82,16 @@ class MainActivity : AppCompatActivity() {
         // 玻璃：把内容层（本栏的兄弟节点）指定为模糊目标
         tabBar.setup(findViewById(R.id.blur_content))
 
+        findViewById<TextView>(R.id.row_rules).setOnClickListener {
+            startActivity(Intent(this, RulesActivity::class.java))
+        }
+        findViewById<TextView>(R.id.row_keepalive).setOnClickListener {
+            startActivity(Intent(this, KeepAliveSettingsActivity::class.java))
+        }
+        findViewById<TextView>(R.id.row_maintain).setOnClickListener {
+            startActivity(Intent(this, MaintenanceActivity::class.java))
+        }
+
         pages = listOf(findViewById(R.id.page_home), findViewById(R.id.page_settings), findViewById(R.id.page_about))
         tabs = listOf(findViewById(R.id.tab_home), findViewById(R.id.tab_settings), findViewById(R.id.tab_about))
         tabs.forEachIndexed { i, tab -> tab.setOnClickListener { selectTab(i) } }
@@ -112,9 +122,6 @@ class MainActivity : AppCompatActivity() {
         findViewById<TextView>(R.id.recent_entry).setOnClickListener {
             startActivity(Intent(this, RecentActivity::class.java))
         }
-        findViewById<TextView>(R.id.rules_entry).setOnClickListener {
-            startActivity(Intent(this, RulesActivity::class.java))
-        }
 
         // —— 设置 ——
         batteryButton.setOnClickListener { requestIgnoreBatteryOptimization() }
@@ -125,10 +132,6 @@ class MainActivity : AppCompatActivity() {
             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             cm.setPrimaryClip(ClipData.newPlainText("adb", KeepAlive.ADB_GRANT_CMD))
             Toast.makeText(this, R.string.keepalive_copied, Toast.LENGTH_SHORT).show()
-        }
-        findViewById<Button>(R.id.settings_check_button).setOnClickListener { btn ->
-            btn.isEnabled = false
-            runCheck { btn.isEnabled = true }
         }
         findViewById<Button>(R.id.clear_cache_button).setOnClickListener {
             AppLabels.clearCache()
