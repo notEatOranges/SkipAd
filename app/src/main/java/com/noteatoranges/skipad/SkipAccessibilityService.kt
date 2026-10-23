@@ -83,6 +83,11 @@ class SkipAccessibilityService : AccessibilityService() {
         KeepAlive.scheduleJob(this)
         StatsStore.logEvent(this, getString(R.string.ka_log_connected))
         postWorkNotification()
+        inst = this
+        if (com.noteatoranges.skipad.util.CaptureBubble.isEnabled(this)) {
+            com.noteatoranges.skipad.util.CaptureBubble.apply(this)
+            com.noteatoranges.skipad.util.CaptureBubble.onClick = { bubbleClicked() }
+        }
         registerReceiver(
             snapshotReceiver, IntentFilter(ACTION_TAKE_SNAPSHOT),
             ContextCompat.RECEIVER_NOT_EXPORTED,
@@ -108,7 +113,23 @@ class SkipAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        com.noteatoranges.skipad.util.CaptureBubble.hide(this)
+        inst = null
         runCatching { unregisterReceiver(snapshotReceiver) }
+    }
+
+    /** 悬浮窗点击：隐藏圆钮 → 广播抓取（服务同应用接收）→ 弹回 */
+    fun bubbleClicked() {
+        com.noteatoranges.skipad.util.CaptureBubble.hide(this)
+        mainHandler.postDelayed({
+            sendBroadcast(Intent(ACTION_TAKE_SNAPSHOT).setPackage(packageName))
+        }, 250)
+        mainHandler.postDelayed({
+            if (com.noteatoranges.skipad.util.CaptureBubble.isEnabled(this)) {
+                com.noteatoranges.skipad.util.CaptureBubble.apply(this)
+                com.noteatoranges.skipad.util.CaptureBubble.onClick = { bubbleClicked() }
+            }
+        }, 1500)
     }
 
     override fun onInterrupt() {}
@@ -414,8 +435,15 @@ class SkipAccessibilityService : AccessibilityService() {
         }
     }
 
-    private companion object {
+    companion object {
         const val TAG = "SkipAdEngine"
+
+        /** 供悬浮窗开关等外部调用拿到运行中的服务实例（服务存活期非空） */
+        val instance: SkipAccessibilityService?
+            get() = inst
+
+        @Volatile
+        private var inst: SkipAccessibilityService? = null
         const val THROTTLE_MS = 150L
         const val COOLDOWN_MS = 4000L
         const val UNBIND_RECOVER_DELAY_MS = 1500L

@@ -37,7 +37,13 @@
     <string name="snap_channel">快照与规则</string>
     <string name="snap_notif_title">SkipAd 运行中</string>
     <string name="snap_notif_text">遇到杀不掉的广告？下拉点「抓取快照」，回 App 点选生成跳过规则</string>
+    <string name="snapshot_selected">选中的元素</string>
+    <string name="snapshot_pick_hint">点选截图上的元素（或下方列表），然后生成跳过规则</string>
+    <string name="action_generate_rule">生成跳过规则</string>
+    <string name="section_nodes">全部节点（可点击的排前）</string>
     <string name="snap_action">抓取快照</string>
+    <string name="bubble_switch_title">抓取悬浮窗</string>
+    <string name="bubble_switch_sub">开启后屏幕常驻小圆钮，广告出现时点一下即抓取，不用下拉通知栏；圆钮可拖动</string>
     <string name="snapshot_hint">点选下方任一节点生成跳过规则；可点击的节点排在最前。生成后规则立即生效，下次同款广告自动跳过。</string>
     <string name="snap_saved">快照已保存</string>
     <string name="snap_failed">快照失败：没找到可抓取的应用窗口</string>

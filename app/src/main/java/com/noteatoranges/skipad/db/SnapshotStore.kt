@@ -50,6 +50,7 @@ object SnapshotStore {
                 put("vid", n.vid)
                 put("clickable", n.clickable)
                 put("l", n.l); put("t", n.t); put("r", n.r); put("b", n.b)
+                put("w", n.w); put("h", n.h)
             })
         }
         File(dir, "tree.json").writeText(arr.toString())
