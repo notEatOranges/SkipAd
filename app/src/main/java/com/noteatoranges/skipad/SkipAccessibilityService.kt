@@ -7,6 +7,7 @@ import android.view.accessibility.AccessibilityEvent
 import com.noteatoranges.skipad.core.BuiltinRules
 import com.noteatoranges.skipad.core.ClickPerformer
 import com.noteatoranges.skipad.core.NodeScanner
+import com.noteatoranges.skipad.db.StatsDb
 import com.noteatoranges.skipad.keepalive.KeepAlive
 import com.noteatoranges.skipad.store.StatsStore
 
@@ -28,13 +29,28 @@ class SkipAccessibilityService : AccessibilityService() {
     private var lastSkipWindow: String? = null
     private var lastSkipAt = 0L
 
+    /** 黑名单 = 静态系统包 + onServiceConnected 时动态解析的 HOME 桌面 */
+    @Volatile
+    private var blacklist: Set<String> = PACKAGE_BLACKLIST
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         scanner = NodeScanner(BuiltinRules.defaults())
         clicker = ClickPerformer(this)
+        // 桌面动态拉黑：HOME 类应用（含厂商桌面）里没有开屏广告，且桌面图标文字
+        // 可能含 "skip"（比如本 App 自己的图标），不拉黑会把图标当跳过按钮点掉
+        blacklist = PACKAGE_BLACKLIST + findHomePackages()
         // 连上系统的同时把保活 Job 确认到位，并留痕到日志环
         KeepAlive.scheduleJob(this)
         StatsStore.logEvent(this, getString(R.string.ka_log_connected))
+    }
+
+    private fun findHomePackages(): Set<String> = try {
+        val home = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+        packageManager.queryIntentActivities(home, 0)
+            .mapTo(mutableSetOf()) { it.activityInfo.packageName }
+    } catch (e: Exception) {
+        emptySet()
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
@@ -66,7 +82,7 @@ class SkipAccessibilityService : AccessibilityService() {
 
         val root = rootInActiveWindow ?: return
         val pkg = root.packageName?.toString() ?: event.packageName?.toString() ?: return
-        if (pkg in PACKAGE_BLACKLIST || pkg == packageName) return
+        if (pkg in blacklist || pkg == packageName) return
 
         val windowKey = "$pkg/${event.className ?: root.className ?: ""}"
         if (windowKey == lastSkipWindow && now - lastSkipAt < COOLDOWN_MS) return
@@ -81,7 +97,7 @@ class SkipAccessibilityService : AccessibilityService() {
         if (clicker?.click(hit.first) == true) {
             lastSkipWindow = windowKey
             lastSkipAt = now
-            StatsStore.recordSkip(this, pkg, detail)
+            StatsDb.get(this).insert(pkg, detail)
         }
     }
 

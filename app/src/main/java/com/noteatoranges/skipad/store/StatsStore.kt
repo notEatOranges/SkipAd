@@ -8,31 +8,20 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * 跳过统计与最近日志。SharedPreferences 存储即可满足"同 App 进程读写"，
- * M1 刻意不引入 Room/DataStore，保持零重型依赖。
+ * 保活事件日志环（SharedPreferences，50 条）。
+ * 0.3.0 起跳过统计/排行/最近记录迁往 StatsDb（SQLite），这里只存保活流水。
  */
 object StatsStore {
 
     private const val PREFS = "skipad_stats"
-    private const val KEY_TOTAL = "total"
     private const val KEY_LOG = "log"
     private const val LOG_LIMIT = 50
 
     private val timeFmt = SimpleDateFormat("MM-dd HH:mm:ss", Locale.CHINA)
 
-    fun recordSkip(context: Context, pkg: String, detail: String) {
-        val prefs = prefs(context)
-        val total = prefs.getInt(KEY_TOTAL, 0) + 1
-        pushLog(prefs, "[$total] ${timeFmt.format(Date())} $pkg 「$detail」")
-        prefs.edit().putInt(KEY_TOTAL, total).apply()
-    }
-
-    /** 保活等非跳过事件也进同一条日志环，UI 统一展示 */
     fun logEvent(context: Context, message: String) {
-        pushLog(prefs(context), "${timeFmt.format(Date())} $message")
+        pushLog(prefs(context), timeFmt.format(Date()) + " " + message)
     }
-
-    fun total(context: Context): Int = prefs(context).getInt(KEY_TOTAL, 0)
 
     fun recentLog(context: Context): List<String> {
         val arr = JSONArray(prefs(context).getString(KEY_LOG, "[]"))
