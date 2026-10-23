@@ -7,13 +7,14 @@ import java.util.Locale
 /**
  * 在节点树中定位"跳过"目标：BFS 遍历 → 规则匹配 → 安全校验 → 返回可点击节点。
  *
- * 稳定性设计：
- * - 遍历有节点数与时间双上限，防御病态层级树拖垮服务主线程；
- * - 命中节点多为不可点击的 TextView，沿父链向上找第一个 isClickable 祖先再返回
- *   （"跳过按钮位置会变"由此天然解决：按特征找节点，坐标跟随节点走）。
+ * 匹配三层（GKD 路数）：
+ * - 文本/描述 关键字与正则（需过右上角位置闸防页面正文误触）；
+ * - **viewId 结构匹配**：viewIdResourceName 含 "skip" 之类即命中，无文本也认——
+ *   国产广告 SDK 的跳过按钮本体（tt_splash_skip_btn / xxx:id/skip_btn），免位置闸；
+ * - 命中节点不可点击时沿父链向上找可点击祖先。
  *
  * 注：AccessibilityNodeInfo.recycle() 在 API 33+ 已废弃（系统接管回收）；
- * 低版本上不主动回收只造成轻微内存压力，换来规避 recycle 误用型崩溃，M1 有意不回收。
+ * 低版本上不主动回收只造成轻微内存压力，换来规避 recycle 误用型崩溃，有意不回收。
  */
 class NodeScanner(rules: List<SkipRule>) {
 
@@ -21,6 +22,7 @@ class NodeScanner(rules: List<SkipRule>) {
         val rule: SkipRule,
         val regexes: List<Regex>,
         val keywords: List<String>,
+        val viewIds: List<String>,
     )
 
     private val compiled: List<Compiled> = rules.filter { it.enabled }.map { r ->
@@ -28,10 +30,11 @@ class NodeScanner(rules: List<SkipRule>) {
             rule = r,
             regexes = if (r.regex) r.patterns.map { Regex(it) } else emptyList(),
             keywords = if (!r.regex) r.patterns.map { it.lowercase(Locale.ROOT) } else emptyList(),
+            viewIds = r.viewIds.map { it.lowercase(Locale.ROOT) },
         )
     }
 
-    /** 最近一次扫描的诊断信息（节点数/采样文本/匹配与拒绝原因），供真机排查 */
+    /** 最近一次扫描的诊断信息（节点数/采样文本与 viewId/匹配与拒绝原因），供真机排查 */
     var lastDebug: String? = null
         private set
 
@@ -60,33 +63,39 @@ class NodeScanner(rules: List<SkipRule>) {
 
             val text = nodeText(node)
             if (text != null && samples.size < 20) samples.add(text.take(16))
-            val matched = firstMatch(node)
-            if (matched != null && text != null) {
-                if (text.length > matched.maxTextLength) {
-                    reject = "「${text.take(12)}」文本超长(${text.length})"
+            val vid = node.viewIdResourceName?.lowercase(Locale.ROOT)
+            if (vid != null && vid.contains("skip") && samples.size < 20) samples.add("vid=$vid")
+
+            val matched = firstMatch(node, text, vid)
+            if (matched != null) {
+                val byViewId = vid != null && matched.viewIds.any { vid.contains(it) }
+                if (!byViewId && (text == null || text.length > matched.rule.maxTextLength)) {
+                    reject = "「${text?.take(12)}」文本超长(${text?.length})"
                 } else {
                     val clickable = clickableAncestor(node)
                     when {
                         clickable == null ->
-                            reject = "「${text.take(12)}」无可点击祖先(6级内)"
+                            reject = "「${(text ?: vid)?.take(12)}」无可点击祖先(6级内)"
                         !clickable.isVisibleToUser ->
-                            reject = "「${text.take(12)}」祖先不可见"
+                            reject = "「${(text ?: vid)?.take(12)}」祖先不可见"
                         else -> {
                             val rect = Rect()
                             clickable.getBoundsInScreen(rect)
                             val area = rect.width().toFloat() * rect.height()
                             val pct = (area / screenArea * 100).toInt()
-                            // 右上角锚定闸：开屏"跳过"按钮几乎总在上半屏偏右；
-                            // 页面正文里的"跳过xxx"（教程/任务/登录跳过）多在中部，直接拒绝
+                            // 右上角锚定闸：只约束"文本命中"（页面正文的跳过xxx 多在中部）；
+                            // viewId 命中的就是跳过按钮本体，免位置闸
                             val cx = rect.exactCenterX()
                             val cy = rect.exactCenterY()
-                            if (cx < screenW * 0.4f || cy > screenH * 0.6f) {
-                                reject = "「${text.take(12)}」不在顶部右侧(cx=${cx.toInt()},cy=${cy.toInt()})"
-                            } else if (area in 1f..screenArea * matched.maxAreaRatio) {
-                                lastDebug = "HIT「${text.take(16)}」面积${pct}% 规则=${matched.id}"
-                                return clickable to matched
+                            val inCorner = cx >= screenW * 0.4f && cy <= screenH * 0.6f
+                            if (!byViewId && !inCorner) {
+                                reject = "「${text?.take(12)}」不在顶部右侧(cx=${cx.toInt()},cy=${cy.toInt()})"
+                            } else if (area in 1f..screenArea * matched.rule.maxAreaRatio) {
+                                lastDebug = "HIT「${(text ?: vid)?.take(20)}」面积${pct}% 规则=${matched.rule.id}" +
+                                    if (byViewId) "(viewId)" else ""
+                                return clickable to matched.rule
                             } else {
-                                reject = "「${text.take(12)}」祖先面积${pct}%超限"
+                                reject = "「${(text ?: vid)?.take(12)}」祖先面积${pct}%超限"
                             }
                         }
                     }
@@ -102,12 +111,18 @@ class NodeScanner(rules: List<SkipRule>) {
         return null
     }
 
-    private fun firstMatch(node: AccessibilityNodeInfo): SkipRule? {
-        val text = nodeText(node) ?: return null
-        val lower = text.lowercase(Locale.ROOT)
+    private fun firstMatch(
+        node: AccessibilityNodeInfo,
+        text: String?,
+        vid: String?,
+    ): Compiled? {
+        val lower = text?.lowercase(Locale.ROOT)
         for (c in compiled) {
-            if (c.regexes.any { it.containsMatchIn(text) }) return c.rule
-            if (c.keywords.any { lower.contains(it) }) return c.rule
+            if (text != null) {
+                if (c.regexes.any { it.containsMatchIn(text) }) return c
+                if (c.keywords.any { lower!!.contains(it) }) return c
+            }
+            if (vid != null && c.viewIds.any { vid.contains(it) }) return c
         }
         return null
     }

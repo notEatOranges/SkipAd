@@ -13,17 +13,22 @@ package com.noteatoranges.skipad.core
 data class SkipRule(
     val id: String,
     /** regex=false 时为关键字（忽略大小写包含匹配）；regex=true 时为正则 */
-    val patterns: List<String>,
+    val patterns: List<String> = emptyList(),
     val regex: Boolean = false,
+    /** viewId 资源名包含匹配（忽略大小写，如 "skip" 命中 tt_splash_skip_btn）；命中免文本与位置闸 */
+    val viewIds: List<String> = emptyList(),
     val maxTextLength: Int = 24,
     val maxAreaRatio: Float = 0.12f,
     val enabled: Boolean = true,
 )
 
-/** M1 内置默认规则：多语言关键字 + 倒计时正则 */
+/** M1 内置默认规则：多语言关键字 + 倒计时正则 + viewId 结构匹配（GKD 路数） */
 object BuiltinRules {
 
     fun defaults(): List<SkipRule> = listOf(
+        // viewId 带 skip 的基本就是广告 SDK 的跳过按钮本体（穿山甲 tt_splash_skip_btn、
+        // 各家 xxx:id/skip_btn…），无文本也命中——GKD 订阅规则的主力手法
+        SkipRule(id = "ad-skip-viewid", viewIds = listOf("skip")),
         SkipRule(
             id = "splash-common-text",
             // zh-CN/zh-TW/ja/ko/en 常见"跳过"文案；contains 匹配天然覆盖"跳过 3""Skip 5s"等倒计时变体
