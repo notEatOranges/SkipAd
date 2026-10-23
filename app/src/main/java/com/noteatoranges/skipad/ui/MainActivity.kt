@@ -14,7 +14,9 @@ import android.os.PowerManager
 import android.os.Process
 import android.provider.Settings
 import android.view.View
+import android.view.ViewGroup
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -28,6 +30,7 @@ import com.noteatoranges.skipad.db.StatsDb
 import com.noteatoranges.skipad.keepalive.KeepAlive
 import com.noteatoranges.skipad.store.StatsStore
 import com.noteatoranges.skipad.util.AppLabels
+import com.noteatoranges.skipad.util.GlassTabBar
 import com.noteatoranges.skipad.util.Ui
 import java.util.Locale
 
@@ -53,11 +56,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var notifStatus: TextView
     private lateinit var notifButton: Button
     private lateinit var kaLogText: TextView
+    private lateinit var tabBar: LinearLayout
+
+    private var glassTabs: GlassTabBar? = null
+    private var bottomInsetPx = 0
+    private var currentTab = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-        Ui.edgeToEdge(this, findViewById(R.id.inset_top), findViewById(R.id.inset_bottom))
 
         statusText = findViewById(R.id.status_text)
         actionButton = findViewById(R.id.action_button)
@@ -72,10 +79,49 @@ class MainActivity : AppCompatActivity() {
         notifStatus = findViewById(R.id.notif_status_text)
         notifButton = findViewById(R.id.notif_button)
         kaLogText = findViewById(R.id.ka_log_text)
+        tabBar = findViewById(R.id.tab_bar)
+
+        // 真·玻璃 Tab 栏（子窗口 + 系统模糊，31+）；兜底底色先挂上，玻璃就绪后再隐藏普通栏
+        tabBar.setBackgroundResource(R.drawable.bg_tabbar)
+        if (Build.VERSION.SDK_INT >= 31) {
+            val bar = GlassTabBar(
+                this,
+                listOf(
+                    getString(R.string.tab_home),
+                    getString(R.string.tab_settings),
+                    getString(R.string.tab_about),
+                )
+            ) { idx -> selectTab(idx) }
+            bar.onAvailable = {
+                glassTabs = bar
+                tabBar.visibility = View.GONE
+                bar.setBottomInset(bottomInsetPx)
+                bar.setSelected(currentTab)
+            }
+            bar.create()
+        }
 
         pages = listOf(findViewById(R.id.page_home), findViewById(R.id.page_settings), findViewById(R.id.page_about))
         tabs = listOf(findViewById(R.id.tab_home), findViewById(R.id.tab_settings), findViewById(R.id.tab_about))
         tabs.forEachIndexed { i, tab -> tab.setOnClickListener { selectTab(i) } }
+
+        // 沉浸式 + 底部安全区：内容滚到手势条底下，玻璃 Tab 栏浮在其上
+        Ui.edgeToEdge(this, findViewById(R.id.inset_top)) { bottom ->
+            bottomInsetPx = bottom
+            if (glassTabs == null) {
+                tabBar.layoutParams = (tabBar.layoutParams as FrameLayout.LayoutParams).apply {
+                    bottomMargin = bottom + dp(14)
+                    width = glassWidth()
+                }
+                tabBar.requestLayout()
+            }
+            glassTabs?.setBottomInset(bottom)
+            pages.forEach { p ->
+                (p as ViewGroup).getChildAt(0).setPadding(
+                    dp(20), 0, dp(20), dp(96) + bottom
+                )
+            }
+        }
 
         // —— 首页 ——
         actionButton.setOnClickListener {
@@ -127,13 +173,25 @@ class MainActivity : AppCompatActivity() {
         refresh()
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        glassTabs?.dismiss()
+    }
+
+    private fun glassWidth(): Int =
+        minOf(dp(300), resources.displayMetrics.widthPixels - dp(40))
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
+
     private fun selectTab(index: Int) {
+        currentTab = index
         pages.forEachIndexed { i, p -> p.visibility = if (i == index) View.VISIBLE else View.GONE }
         tabs.forEachIndexed { i, t ->
             t.setBackgroundResource(if (i == index) R.drawable.bg_tab_on else android.R.color.transparent)
             t.setTextColor(getColor(if (i == index) R.color.primary else R.color.text_secondary))
             t.isActivated = i == index
         }
+        glassTabs?.setSelected(index)
     }
 
     private fun refresh() {

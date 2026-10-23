@@ -2,6 +2,26 @@
 
 > 规矩：每轮修改必须记录（改了什么/为什么/影响面/踩坑），换电脑先读本文件再动手。
 
+## 0.4.0 - 2026-10-23 · 真·玻璃 Tab 栏（系统跨窗口模糊）+ 底部全沉浸 + compileSdk 37
+
+**改了什么**
+- **玻璃悬浮 Tab 栏**：`GlassTabBar` 用依附子窗口（TYPE_APPLICATION_ATTACHED_DIALOG）+ `FLAG_BLUR_BEHIND` + `blurBehindRadius`，走系统对话框同一条 Kawase 模糊管线，真实模糊栏后滚动的页面内容；**三个 Tab 文字放进玻璃窗口内**（玻璃必然盖住底下视图，文字必须在玻璃上面），窗口 NOT_FOCUSABLE＝可点不可焦点，点击回调切页；无模糊环境自动加浓白底退化；
+- **底部全沉浸**：删掉底部 inset 垫片，页面内容直接滚到手势条和 Tab 栏底下（尾部留 96dp+inset 清空区），玻璃栏浮在手势条上方 14dp；
+- **compileSdk 34→37**（targetSdk 仍 34）：AGP 8.2.2 + `android.suppressUnsupportedCompileSdk=37` 压警告，不冒险升 AGP/Gradle；platform-37 手动解压进 SDK 并手写 package.xml（api-level 整数 37）；
+- 版本 0.4.0 / versionCode 5。
+
+**为什么**
+- 用户令：Tab 栏要「安卓17的玻璃，不是毛玻璃」≈ 酷安效果；底部安全区也要真沉浸（内容延伸到底）。
+
+**影响面**
+- Tab 文字从布局迁进子窗口：`selectTab` 双写（布局 Tab 兜底 + 玻璃 Tab），`currentTab` 统一状态；玻璃创建失败/低版本自动退回自绘底色的普通 Tab 栏，功能无损；无权限变化。
+
+**踩坑/备注**
+- **Android 17 玻璃 API 考据**（SDK 37 的 api-versions.xml 对比 36.1 差集）：37 新增 `android.view.BlurRegion` / `RoundedRectBlurRegion` / `SurfaceView.setBlurRegions()`——玻璃片语义，但 SurfaceView 在单窗口打孔模式下"身后"没有可模糊层，实测渲染成黑块；其正确场景是独立 overlay 的玻璃片。当前采用 **31+ 跨窗口模糊管线**（`mBlurEnabled=true` 实测可用，dumpsys 可见 `AtchDlg` 窗口 `blurBehindRadius=98`），后续做独立玻璃面板时再上 BlurRegion；
+- **子窗口创建时机**：onCreate 阶段 `decorView.windowToken` 还是 null，addView 必 BadToken——必须推迟到首帧 attach 后（decorView.post 重试），就绪后回调里再隐藏布局 Tab 栏，失败保持兜底底色；
+- Android 12+ 有些 ROM 把跨窗口模糊藏在开发者选项，关掉时 `isCrossWindowBlurEnabled=false`，本 App 自动加浓白底不破相；
+- platform-37 的 source.properties 里 ApiLevel 写作 "37.0"（minor 版本化），手动装平台时 package.xml 的 api-level 要写整数 37。
+
 ## 0.3.1 - 2026-10-23 · 悬浮 Tab 信息架构（首页 / 设置 / 关于）
 
 **改了什么**
