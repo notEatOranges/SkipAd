@@ -16,6 +16,7 @@ import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.noteatoranges.skipad.core.BuiltinRules
@@ -300,8 +301,30 @@ class SkipAccessibilityService : AccessibilityService() {
     }
 
     /** 抓快照：截图 + 控件树 JSON 落盘（GKD 同款），供点选生成规则 */
+    /** 抓快照：从通知栏触发时前台是通知栏自身——先收起通知栏再截屏抓树（GKD 用悬浮窗同理） */
     private fun takeSnapshot() {
-        val root = rootInActiveWindow ?: return
+        val shadeUp = rootInActiveWindow?.packageName?.toString() == "com.android.systemui"
+        if (shadeUp) {
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            mainHandler.postDelayed({ captureNow() }, 600)
+        } else {
+            captureNow()
+        }
+    }
+
+    private fun captureNow() {
+        var root = rootInActiveWindow
+        // 兜底：活动窗口还是系统层时，从窗口列表里找第一个应用窗口
+        if (root == null || root.packageName?.toString() == "com.android.systemui") {
+            root = windows.firstOrNull {
+                it.root != null && it.root.packageName?.toString() !in setOf(
+                    "com.android.systemui", packageName
+                )
+            }?.root ?: run {
+                Toast.makeText(this, R.string.snap_failed, Toast.LENGTH_SHORT).show()
+                return
+            }
+        }
         val pkg = root.packageName?.toString() ?: return
         val act = lastActivityClass[pkg] ?: ""
         val w = resources.displayMetrics.widthPixels
@@ -331,12 +354,14 @@ class SkipAccessibilityService : AccessibilityService() {
                     override fun onResult(bitmap: Bitmap?) {
                         val dir = SnapshotStore.save(applicationContext, pkg, act, nodes, bitmap)
                         StatsStore.logEvent(applicationContext, "快照已保存：$pkg（${nodes.size} 节点）")
+                        Toast.makeText(applicationContext, R.string.snap_saved, Toast.LENGTH_SHORT).show()
                         Log.d(TAG, "snapshot saved ${dir.path}")
                     }
                 })
         } else {
             val dir = SnapshotStore.save(applicationContext, pkg, act, nodes, null)
             StatsStore.logEvent(applicationContext, "快照已保存：$pkg（${nodes.size} 节点，无截图）")
+            Toast.makeText(applicationContext, R.string.snap_saved, Toast.LENGTH_SHORT).show()
         }
     }
 
